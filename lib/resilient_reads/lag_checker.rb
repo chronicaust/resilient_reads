@@ -45,9 +45,8 @@ module ResilientReads
     end
 
     def self.lag_for_mysql(conn)
-      result = conn.execute("SHOW SLAVE STATUS")
+      result = conn.execute("SHOW REPLICA STATUS")
       # MySQL 8.0.22+ uses SHOW REPLICA STATUS
-      result = conn.execute("SHOW REPLICA STATUS") if result.respond_to?(:count) && result.count == 0
 
       row = if result.respond_to?(:first)
               result.first
@@ -58,11 +57,12 @@ module ResilientReads
       return nil unless row
 
       # Seconds_Behind_Master / Seconds_Behind_Source (MySQL 8.0.22+)
-      lag = if row.is_a?(Hash)
-              row["Seconds_Behind_Master"] || row["Seconds_Behind_Source"]
-      elsif row.respond_to?(:[])
-              row["Seconds_Behind_Master"] || row["Seconds_Behind_Source"]
-      end
+      lag =
+        if row.is_a?(Hash)
+              row["Seconds_Behind_Source"]
+        elsif row.respond_to?(:[])
+              row["Seconds_Behind_Source"]
+        end
 
       lag&.to_f
     rescue => e

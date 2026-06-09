@@ -57,7 +57,7 @@ class WriteQueryTest < Minitest::Test
 
   def test_mysql_show_is_not_write
     refute ResilientReads.write_query?("SHOW TABLES")
-    refute ResilientReads.write_query?("SHOW SLAVE STATUS")
+    refute ResilientReads.write_query?("SHOW REPLICA STATUS")
     refute ResilientReads.write_query?("SHOW VARIABLES LIKE 'read_only'")
   end
 
