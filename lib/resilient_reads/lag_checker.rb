@@ -45,24 +45,29 @@ module ResilientReads
     end
 
     def self.lag_for_mysql(conn)
-      result = conn.execute("SHOW REPLICA STATUS")
-      # MySQL 8.0.22+ uses SHOW REPLICA STATUS
+      # Prefer SHOW REPLICA STATUS (MySQL 8.0.22+, MariaDB 10.5.1+)
+      # and fall back to the deprecated SHOW SLAVE STATUS.
+      result =
+        begin
+          conn.execute("SHOW REPLICA STATUS")
+        rescue ActiveRecord::StatementInvalid
+          conn.execute("SHOW SLAVE STATUS")
+        end
 
       row = if result.respond_to?(:first)
               result.first
-      elsif result.respond_to?(:to_a)
+            elsif result.respond_to?(:to_a)
               result.to_a.first
-      end
+            end
 
       return nil unless row
 
-      # Seconds_Behind_Master / Seconds_Behind_Source (MySQL 8.0.22+)
-      lag =
-        if row.is_a?(Hash)
-              row["Seconds_Behind_Source"]
-        elsif row.respond_to?(:[])
-              row["Seconds_Behind_Source"]
-        end
+      # Seconds_Behind_Source (MySQL 8.0.22+) / Seconds_Behind_Master (legacy)
+      lag = if row.is_a?(Hash)
+              row["Seconds_Behind_Source"] || row["Seconds_Behind_Master"]
+            elsif row.respond_to?(:[])
+              row["Seconds_Behind_Source"] || row["Seconds_Behind_Master"]
+            end
 
       lag&.to_f
     rescue => e

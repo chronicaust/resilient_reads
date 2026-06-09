@@ -61,6 +61,7 @@ module ResilientReads
         distributing: true,
         on_replica: false,
         routing: false,
+        stick_to_primary: false,
         options: opts
       }
 

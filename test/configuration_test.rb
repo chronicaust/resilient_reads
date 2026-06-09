@@ -20,6 +20,12 @@ class ConfigurationTest < Minitest::Test
     assert_equal true, @config.auto_detect_replicas
     assert_equal 2, @config.primary_delay
     assert_equal({}, @config.default_options)
+    assert_equal true, @config.sticky_writes
+  end
+
+  def test_sticky_writes_configurable
+    @config.sticky_writes = false
+    assert_equal false, @config.sticky_writes
   end
 
   def test_log_query_routing_can_be_disabled

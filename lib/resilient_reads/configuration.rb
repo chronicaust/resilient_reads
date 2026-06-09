@@ -66,6 +66,12 @@ module ResilientReads
     # Maximum number of entries in the SQL pattern cache.
     attr_accessor :query_cache_max_size
 
+    # When true (default), a write inside a distribute_reads block causes
+    # all subsequent reads in the same block to go to primary.  This
+    # prevents stale-read → conflicting-write chains that cause deadlocks,
+    # especially with transactionless writes like update_column.
+    attr_accessor :sticky_writes
+
     def initialize
       @by_default = false
       @eager_load = false
@@ -85,6 +91,7 @@ module ResilientReads
       @default_options = {}
       @query_cache_enabled = true
       @query_cache_max_size = 10_000
+      @sticky_writes = true
     end
   end
 end

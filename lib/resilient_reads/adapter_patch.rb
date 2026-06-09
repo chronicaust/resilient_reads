@@ -13,6 +13,10 @@ module ResilientReads
     # model loading and connection setup.
     SKIP_NAMES = Set.new(%w[SCHEMA EXPLAIN]).freeze
 
+    # SQL clauses that acquire locks and must execute on the primary,
+    # even though the statement starts with SELECT.
+    LOCKING_CLAUSE_PATTERN = /\b(FOR\s+(UPDATE|NO\s+KEY\s+UPDATE|SHARE|KEY\s+SHARE)|LOCK\s+IN\s+SHARE\s+MODE)\b/i
+
     def raw_execute(sql, *args, **kwargs)
       ctx = Thread.current[:resilient_reads_context]
       name = args.first
@@ -21,13 +25,27 @@ module ResilientReads
          ctx[:distributing] &&
          !ctx[:on_replica] &&
          !ctx[:routing] &&
+         !ctx[:stick_to_primary] &&
          !skip_replica_routing?(sql, name) &&
          open_transactions.zero?
 
         execute_on_replica(sql, ctx, *args, **kwargs)
       else
-        if ctx && ctx[:distributing] && write_query?(sql)
-          ResilientReads.log_query("primary", sql, name, reason: "write query")
+        if ctx && ctx[:distributing]
+          if write_query?(sql)
+            # Sticky writes: after any write inside a distribute_reads
+            # block, all subsequent reads stay on primary for the rest of
+            # the block.  This prevents stale-read → conflicting-write
+            # chains that cause MySQL/InnoDB deadlocks, especially with
+            # transactionless writes like update_column that don't bump
+            # open_transactions.
+            if ResilientReads.config.sticky_writes
+              ctx[:stick_to_primary] = true
+            end
+            ResilientReads.log_query("primary", sql, name, reason: "write query")
+          elsif ctx[:stick_to_primary]
+            ResilientReads.log_query("primary", sql, name, reason: "sticky write")
+          end
         end
         super(sql, *args, **kwargs)
       end
@@ -41,17 +59,25 @@ module ResilientReads
       return true if name.nil? || name == ""
       return true if SKIP_NAMES.include?(name)
       return true if write_query?(sql)
+      return true if locking_query?(sql)
       false
     end
 
+    # Detects SELECT statements that acquire row/table locks
+    # (e.g. SELECT ... FOR UPDATE, LOCK IN SHARE MODE).  These must
+    # execute on the primary — a read-only replica cannot acquire locks.
+    def locking_query?(sql)
+      LOCKING_CLAUSE_PATTERN.match?(sql)
+    end
+
     def execute_on_replica(sql, ctx, *args, **kwargs)
-      # Ensure the primary adapter is connected and its type_map is
-      # initialized.  After raw_execute returns the replica's PG::Result,
-      # the caller (cast_result) invokes get_oid_type on *self* (primary)
-      # to resolve column OIDs.  If all prior reads were routed to replicas,
-      # the primary connection was never materialized — leaving @type_map
-      # nil and causing: NoMethodError: undefined method `key?' for nil.
-      connect! unless type_map
+      # Ensure the primary adapter is connected.  If all prior reads
+      # were routed to replicas, the primary connection was never
+      # materialized.  For PostgreSQL this avoids a nil @type_map
+      # (cast_result → get_oid_type → NoMethodError).  For MySQL/Trilogy
+      # it keeps the primary connection alive so the first write after
+      # many reads doesn't hit a stale/timed-out socket.
+      connect! unless connected?
 
       replica = ResilientReads.replica_pool.next_healthy
 
@@ -84,8 +110,8 @@ module ResilientReads
         ctx[:routing] = false
         result
       rescue ActiveRecord::ConnectionNotEstablished,
-             ActiveRecord::StatementInvalid,
-             ActiveRecord::ConnectionFailed => e
+        ActiveRecord::StatementInvalid,
+        ActiveRecord::ConnectionFailed => e
         ctx[:routing] = false
         raise unless connection_level_error?(e)
 
@@ -136,6 +162,10 @@ module ResilientReads
         cause = error.cause
         cause.is_a?(PG::Error) ||
           cause.is_a?(IOError) ||
+          cause.is_a?(Errno::ETIMEDOUT) ||
+          cause.is_a?(Errno::ECONNRESET) ||
+          cause.is_a?(Errno::EPIPE) ||
+          cause.is_a?(Errno::ECONNREFUSED) ||
           (defined?(PG::ConnectionBad) && cause.is_a?(PG::ConnectionBad)) ||
           (defined?(Trilogy::Error) && cause.is_a?(Trilogy::Error)) ||
           (defined?(Mysql2::Error) && cause.is_a?(Mysql2::Error))

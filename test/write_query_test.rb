@@ -57,12 +57,32 @@ class WriteQueryTest < Minitest::Test
 
   def test_mysql_show_is_not_write
     refute ResilientReads.write_query?("SHOW TABLES")
-    refute ResilientReads.write_query?("SHOW REPLICA STATUS")
+    refute ResilientReads.write_query?("SHOW SLAVE STATUS")
     refute ResilientReads.write_query?("SHOW VARIABLES LIKE 'read_only'")
   end
 
   def test_describe_is_not_write
     refute ResilientReads.write_query?("DESCRIBE users")
     refute ResilientReads.write_query?("DESC users")
+  end
+
+  # Locking reads — detected via LOCKING_CLAUSE_PATTERN, not WRITE_PATTERN.
+  # These start with SELECT but must run on primary.
+  def test_locking_reads_are_not_classified_as_writes
+    refute ResilientReads.write_query?("SELECT * FROM users FOR UPDATE")
+    refute ResilientReads.write_query?("SELECT * FROM users FOR SHARE")
+    refute ResilientReads.write_query?("SELECT * FROM users LOCK IN SHARE MODE")
+  end
+
+  def test_locking_clause_pattern_detects_locking_reads
+    pattern = ResilientReads::AdapterPatch::LOCKING_CLAUSE_PATTERN
+    assert pattern.match?("SELECT * FROM users FOR UPDATE")
+    assert pattern.match?("SELECT * FROM users WHERE id = 1 FOR UPDATE")
+    assert pattern.match?("SELECT * FROM users FOR SHARE")
+    assert pattern.match?("SELECT * FROM users FOR NO KEY UPDATE")
+    assert pattern.match?("SELECT * FROM users FOR KEY SHARE")
+    assert pattern.match?("SELECT * FROM users LOCK IN SHARE MODE")
+    refute pattern.match?("SELECT * FROM users WHERE id = 1")
+    refute pattern.match?("UPDATE users SET name = 'test'")
   end
 end
