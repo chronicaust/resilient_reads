@@ -19,7 +19,7 @@ Drop-in replacement for [distribute_reads](https://github.com/ankane/distribute_
 Add to your Gemfile:
 
 ```ruby
-gem "resilient_reads", path: "gems/resilient_reads"
+gem "resilient_reads"
 ```
 
 Remove any previous read-distribution gems:
