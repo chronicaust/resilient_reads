@@ -1,6 +1,6 @@
-# frozen_string_literal: true
-
-$LOAD_PATH.unshift File.expand_path("../lib", __dir__)
+require "minitest/autorun"
+require "active_record"
 require "resilient_reads"
 
-require "minitest/autorun"
+# Minimal test setup — no real DB needed for unit tests.
+# Integration tests that need a DB should be run inside the Rails app.
