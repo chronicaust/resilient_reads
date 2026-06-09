@@ -1,0 +1,147 @@
+module ResilientReads
+  # Prepended onto the database adapter (e.g. PostgreSQLAdapter, Mysql2Adapter, TrilogyAdapter).
+  # Intercepts raw_execute and routes SELECT queries to a healthy replica
+  # when inside a distribute_reads block.  Writes always pass through to
+  # the primary connection.
+  #
+  # Uses *args/**kwargs to stay compatible across Rails versions:
+  #   Rails 7.1/7.2: raw_execute(sql, name, async:, allow_retry:, materialize_transactions:)
+  #   Rails 8.0+:    raw_execute(sql, name, binds, prepare:, async:, allow_retry:, materialize_transactions:, batch:)
+  module AdapterPatch
+    # Query names that should never be routed to a replica. These are
+    # schema introspection or internal bookkeeping queries that run during
+    # model loading and connection setup.
+    SKIP_NAMES = Set.new(%w[SCHEMA EXPLAIN]).freeze
+
+    def raw_execute(sql, *args, **kwargs)
+      ctx = Thread.current[:resilient_reads_context]
+      name = args.first
+
+      if ctx &&
+         ctx[:distributing] &&
+         !ctx[:on_replica] &&
+         !ctx[:routing] &&
+         !skip_replica_routing?(sql, name) &&
+         open_transactions.zero?
+
+        execute_on_replica(sql, ctx, *args, **kwargs)
+      else
+        if ctx && ctx[:distributing] && write_query?(sql)
+          ResilientReads.log_query("primary", sql, name, reason: "write query")
+        end
+        super(sql, *args, **kwargs)
+      end
+    end
+
+    private
+
+    # Schema queries, internal queries, and queries without a name
+    # (connection setup, etc.) should always hit the primary.
+    def skip_replica_routing?(sql, name)
+      return true if name.nil? || name == ""
+      return true if SKIP_NAMES.include?(name)
+      return true if write_query?(sql)
+      false
+    end
+
+    def execute_on_replica(sql, ctx, *args, **kwargs)
+      # Ensure the primary adapter is connected and its type_map is
+      # initialized.  After raw_execute returns the replica's PG::Result,
+      # the caller (cast_result) invokes get_oid_type on *self* (primary)
+      # to resolve column OIDs.  If all prior reads were routed to replicas,
+      # the primary connection was never materialized — leaving @type_map
+      # nil and causing: NoMethodError: undefined method `key?' for nil.
+      connect! unless type_map
+
+      replica = ResilientReads.replica_pool.next_healthy
+
+      unless replica
+        ResilientReads.log_query("primary", sql, args.first, reason: "no healthy replicas")
+        return execute_on_primary(sql, ctx, *args, **kwargs)
+      end
+
+      # Optional lag check — uses cached value to avoid querying on every request.
+      if ResilientReads.config.max_lag
+        lag = replica.cached_lag
+        if lag && lag > ResilientReads.config.max_lag
+          if ResilientReads.config.lag_failover
+            ResilientReads.log_query("primary", sql, args.first, reason: "replica '#{replica.name}' lag #{lag.round(1)}s > max #{ResilientReads.config.max_lag}s")
+            return execute_on_primary(sql, ctx, *args, **kwargs)
+          else
+            raise TooMuchLag, "Replication lag is #{lag.round(1)}s (max #{ResilientReads.config.max_lag}s)"
+          end
+        end
+      end
+
+      # Re-entrancy guard: prevent recursive routing when the replica
+      # connection is being established (its init queries should not
+      # be routed again).
+      ctx[:on_replica] = true
+      ctx[:routing] = true
+      begin
+        ResilientReads.log_query(replica.name, sql, args.first)
+        result = replica.connection.raw_execute(sql, *args, **kwargs)
+        ctx[:routing] = false
+        result
+      rescue ActiveRecord::ConnectionNotEstablished,
+             ActiveRecord::StatementInvalid,
+             ActiveRecord::ConnectionFailed => e
+        ctx[:routing] = false
+        raise unless connection_level_error?(e)
+
+        ResilientReads.replica_pool.mark_unhealthy(replica)
+        ResilientReads.log(:warn, "Replica '#{replica.name}' failed (#{e.class}), trying next")
+
+        # One retry on a different replica
+        retry_replica = ResilientReads.replica_pool.next_healthy
+        if retry_replica
+          begin
+            ctx[:routing] = true
+            ResilientReads.log_query(retry_replica.name, sql, args.first, reason: "retry after '#{replica.name}' failed")
+            result = retry_replica.connection.raw_execute(sql, *args, **kwargs)
+            ctx[:routing] = false
+            return result
+          rescue => retry_err
+            ctx[:routing] = false
+            ResilientReads.replica_pool.mark_unhealthy(retry_replica)
+            ResilientReads.log(:warn, "Retry replica '#{retry_replica.name}' also failed: #{retry_err.message}")
+          end
+        end
+
+        if ResilientReads.config.failover
+          ResilientReads.log_query("primary", sql, args.first, reason: "all replicas exhausted")
+          execute_on_primary(sql, ctx, *args, **kwargs)
+        else
+          raise NoHealthyReplica, "No healthy replicas available and failover is disabled"
+        end
+      ensure
+        ctx[:on_replica] = false
+        ctx[:routing] = false
+        replica&.release_connection rescue nil
+      end
+    end
+
+    def execute_on_primary(sql, ctx, *args, **kwargs)
+      ctx[:distributing] = false
+      raw_execute(sql, *args, **kwargs)
+    ensure
+      ctx[:distributing] = true
+    end
+
+    def connection_level_error?(error)
+      case error
+      when ActiveRecord::ConnectionNotEstablished, ActiveRecord::ConnectionFailed
+        true
+      when ActiveRecord::StatementInvalid
+        cause = error.cause
+        cause.is_a?(PG::Error) ||
+          cause.is_a?(IOError) ||
+          (defined?(PG::ConnectionBad) && cause.is_a?(PG::ConnectionBad)) ||
+          (defined?(Trilogy::Error) && cause.is_a?(Trilogy::Error)) ||
+          (defined?(Mysql2::Error) && cause.is_a?(Mysql2::Error))
+      else
+        false
+      end
+    end
+  end
+end
