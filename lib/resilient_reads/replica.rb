@@ -85,8 +85,16 @@ module ResilientReads
     end
 
     # Verify the replica is reachable. Returns true/false and updates health.
+    # Uses the raw connection to avoid ActiveRecord SQL instrumentation/logging.
     def check_health!
-      @connection_class.connection.execute("SELECT 1")
+      raw = @connection_class.connection.raw_connection
+      if raw.respond_to?(:exec)         # PG::Connection
+        raw.exec("SELECT 1")
+      elsif raw.respond_to?(:ping)      # Mysql2::Client / Trilogy
+        raw.ping
+      else
+        @connection_class.connection.execute("SELECT 1")
+      end
       mark_healthy!
       true
     rescue => e
