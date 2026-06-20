@@ -11,7 +11,7 @@ module ResilientReads
     # Query names that should never be routed to a replica. These are
     # schema introspection or internal bookkeeping queries that run during
     # model loading and connection setup.
-    SKIP_NAMES = Set.new(%w[SCHEMA EXPLAIN]).freeze
+    SKIP_NAMES = Set.new(%w[SCHEMA EXPLAIN TRANSACTION]).freeze
 
     # SQL clauses that acquire locks and must execute on the primary,
     # even though the statement starts with SELECT.
@@ -31,15 +31,21 @@ module ResilientReads
 
         execute_on_replica(sql, ctx, *args, **kwargs)
       else
-        if ctx && ctx[:distributing]
-          if write_query?(sql)
-            # Sticky writes: after any write inside a distribute_reads
+        if ctx && ctx[:distributing] && !ctx[:on_replica]
+          adapter_write = write_query?(sql)
+
+          if adapter_write || ResilientReads.write_query?(sql)
+            # Sticky writes: after any DML write inside a distribute_reads
             # block, all subsequent reads stay on primary for the rest of
             # the block.  This prevents stale-read → conflicting-write
             # chains that cause MySQL/InnoDB deadlocks, especially with
             # transactionless writes like update_column that don't bump
             # open_transactions.
-            if ResilientReads.config.sticky_writes
+            #
+            # Only adapter-detected writes (DML/DDL) trigger sticky —
+            # transaction commands (BEGIN/COMMIT) are handled by the
+            # open_transactions guard instead.
+            if ResilientReads.config.sticky_writes && adapter_write
               ctx[:stick_to_primary] = true
             end
             ResilientReads.log_query("primary", sql, name, reason: "write query")
@@ -53,12 +59,17 @@ module ResilientReads
 
     private
 
-    # Schema queries, internal queries, and queries without a name
-    # (connection setup, etc.) should always hit the primary.
+    # Queries that must stay on the primary: writes, transaction
+    # commands, schema introspection, and locking reads.
+    #
+    # We check *both* the adapter's write_query? (which knows about
+    # adapter-specific DDL/DML) and ResilientReads' own WRITE_PATTERN
+    # (which catches transaction commands like BEGIN/COMMIT/SET that
+    # some adapters classify as reads).
     def skip_replica_routing?(sql, name)
-      return true if name.nil? || name == ""
-      return true if SKIP_NAMES.include?(name)
+      return true if name && SKIP_NAMES.include?(name)
       return true if write_query?(sql)
+      return true if ResilientReads.write_query?(sql)
       return true if locking_query?(sql)
       false
     end

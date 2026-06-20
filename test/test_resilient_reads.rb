@@ -7,7 +7,11 @@ class TestResilientReads < Minitest::Test
     refute_nil ::ResilientReads::VERSION
   end
 
-  def test_it_does_something_useful
-    assert false
+  def test_write_query_detects_transaction_commands
+    assert ResilientReads.write_query?("BEGIN")
+    assert ResilientReads.write_query?("COMMIT")
+    assert ResilientReads.write_query?("ROLLBACK")
+    assert ResilientReads.write_query?("SET search_path TO public")
+    refute ResilientReads.write_query?("SELECT 1")
   end
 end

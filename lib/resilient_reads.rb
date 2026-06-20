@@ -111,7 +111,7 @@ module ResilientReads
       logger = config.logger
       return unless logger
 
-      # logger.public_send(level, "[ResilientReads] #{message}")
+      logger.public_send(level, "[ResilientReads] #{message}")
     rescue
       # Never let logging break query flow.
     end

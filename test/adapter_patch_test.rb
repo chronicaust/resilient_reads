@@ -81,6 +81,111 @@ class AdapterPatchTest < Minitest::Test
     assert ResilientReads::AdapterPatch::SKIP_NAMES.include?("EXPLAIN")
   end
 
+  def test_skip_names_includes_transaction
+    assert ResilientReads::AdapterPatch::SKIP_NAMES.include?("TRANSACTION")
+  end
+
+  # Reads with a nil name (e.g. from connection.execute) should be
+  # routed to replicas, not silently pinned to primary.
+  def test_nil_name_select_routed_to_replica
+    adapter_class = Class.new do
+      prepend ResilientReads::AdapterPatch
+
+      attr_reader :executed_on_primary
+
+      def initialize
+        @executed_on_primary = []
+        @is_connected = true
+      end
+
+      def connected?; @is_connected; end
+      def connect!; @is_connected = true; self; end
+      def open_transactions; 0; end
+
+      def write_query?(sql)
+        ResilientReads::WRITE_PATTERN.match?(sql)
+      end
+
+      def raw_execute(sql, *args, **kwargs)
+        @executed_on_primary << sql
+        "primary_result"
+      end
+    end
+
+    adapter = adapter_class.new
+
+    mock_replica = Object.new
+    def mock_replica.name; "replica"; end
+    def mock_replica.healthy?; true; end
+    def mock_replica.cached_lag; nil; end
+    def mock_replica.connection
+      conn = Object.new
+      def conn.raw_execute(sql, *args, **kwargs); "replica_result"; end
+      conn
+    end
+    def mock_replica.release_connection; end
+
+    pool = ResilientReads.replica_pool
+    original_replicas = pool.instance_variable_get(:@replicas)
+    pool.instance_variable_set(:@replicas, [mock_replica])
+
+    Thread.current[:resilient_reads_context] = {
+      distributing: true,
+      on_replica: false,
+      routing: false,
+      stick_to_primary: false,
+      options: {}
+    }
+
+    result = adapter.raw_execute("SELECT * FROM users", nil)
+    assert_equal "replica_result", result, "nil-name SELECT should route to replica"
+    refute_includes adapter.executed_on_primary, "SELECT * FROM users"
+  ensure
+    Thread.current[:resilient_reads_context] = nil
+    pool.instance_variable_set(:@replicas, original_replicas || [])
+  end
+
+  # Transaction SQL (BEGIN, COMMIT, SET, etc.) must always stay on
+  # primary even when called with a non-SKIP name.
+  def test_transaction_sql_stays_on_primary
+    adapter_class = build_tracking_adapter
+    adapter = adapter_class.new
+
+    pool = ResilientReads.replica_pool
+    original_replicas = pool.instance_variable_get(:@replicas)
+    mock_replica = Object.new
+    def mock_replica.name; "replica"; end
+    def mock_replica.healthy?; true; end
+    def mock_replica.cached_lag; nil; end
+    def mock_replica.connection
+      conn = Object.new
+      def conn.raw_execute(sql, *args, **kwargs); "replica_result"; end
+      conn
+    end
+    def mock_replica.release_connection; end
+    pool.instance_variable_set(:@replicas, [mock_replica])
+
+    Thread.current[:resilient_reads_context] = {
+      distributing: true,
+      on_replica: false,
+      routing: false,
+      stick_to_primary: false,
+      options: {}
+    }
+
+    %w[BEGIN COMMIT ROLLBACK].each do |cmd|
+      adapter.raw_execute(cmd, "Custom")
+      assert_includes adapter.executed_on_primary, cmd,
+        "#{cmd} should go to primary even with a non-SKIP name"
+    end
+
+    adapter.raw_execute("SET search_path TO public", "Custom")
+    assert_includes adapter.executed_on_primary, "SET search_path TO public"
+  ensure
+    Thread.current[:resilient_reads_context] = nil
+    pool.instance_variable_set(:@replicas, original_replicas || [])
+  end
+
   def test_context_includes_routing_flag
     Thread.current[:resilient_reads_context] = {
       distributing: true,
