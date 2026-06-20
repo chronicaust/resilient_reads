@@ -98,8 +98,18 @@ module ResilientReads
       end
 
       # Optional lag check — uses cached value to avoid querying on every request.
+      # The routing guard must be set while the lag query runs so that the
+      # replica adapter's patched raw_execute doesn't re-enter
+      # execute_on_replica (the lag SQL is a SELECT executed on the replica
+      # connection, which would otherwise pass skip_replica_routing? and
+      # recurse infinitely).
       if ResilientReads.config.max_lag
-        lag = replica.cached_lag
+        ctx[:routing] = true
+        begin
+          lag = replica.cached_lag
+        ensure
+          ctx[:routing] = false
+        end
         if lag && lag > ResilientReads.config.max_lag
           if ResilientReads.config.lag_failover
             ResilientReads.log_query("primary", sql, args.first, reason: "replica '#{replica.name}' lag #{lag.round(1)}s > max #{ResilientReads.config.max_lag}s")
